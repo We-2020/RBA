@@ -4,3 +4,4 @@
 .env
 *.pt
 __pycache__/
+training_logs/
