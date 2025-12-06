@@ -8,6 +8,40 @@ import time
 from thop import profile
 from thop import clever_format
 
+
+class GeometricPositionalEncoding(nn.Module):
+    def __init__(self, num_regions, d_model, coords_dim=3):
+        super().__init__()
+        
+        # 1. 尝试加载或初始化数据
+        try:
+            # 加载数据 (此时可能在 CPU)
+            centroids = torch.load("/home/caojiaxiang/brain age/RBA/pths/region_centroids.pt")
+            print("Loaded region centroids successfully.")
+        except Exception as e:
+            print(f"Warning: Could not load centroids ({e}), using random initialization.")
+            centroids = torch.randn(num_regions, 3)
+
+        # 2. 【关键步骤】使用 register_buffer
+        # 第一个参数是名字（字符串），第二个参数是 tensor
+        # 这样 self.region_centroids 会自动随 model.to(device) 移动
+        self.register_buffer('region_centroids', centroids)
+        
+        self.proj = nn.Sequential(
+            nn.Linear(3, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, d_model)
+        )
+
+    def forward(self, x):
+        # x: [B, num_regions, d_model]
+        
+        # 此时 self.region_centroids 已经和 x 在同一个设备上了
+        # 我们可以直接使用
+        pos_embed = self.proj(self.region_centroids) # [num_regions, d_model]
+        
+        return x + pos_embed.unsqueeze(0)
+
 def evaluate_model_complexity(model, x, region_masks):
     # ===== 1. 参数数量 =====
     total_params = sum(p.numel() for p in model.parameters())
@@ -293,8 +327,8 @@ class BrainRegionTransformer(nn.Module):
         # 可学习的位置编码，因为脑区没有天然的顺序
         # self.positional_encoding = nn.Parameter(torch.randn(1, num_regions, d_model))
         # 使用更小的初始化范围
-        self.positional_encoding = nn.Parameter(torch.zeros(1, num_regions, d_model))
-        nn.init.normal_(self.positional_encoding, mean=0.0, std=0.02)  # 或者使用xavier初始化
+        # self.positional_encoding = nn.Parameter(torch.zeros(1, num_regions, d_model))
+        # nn.init.normal_(self.positional_encoding, mean=0.0, std=0.02)  # 或者使用xavier初始化
         # Transformer编码器
         encoder_layers = nn.TransformerEncoderLayer(
             d_model=d_model, 
@@ -304,6 +338,7 @@ class BrainRegionTransformer(nn.Module):
             batch_first=True,  # 使用batch_first格式
             activation='gelu'
         )
+        self.addPs = GeometricPositionalEncoding(117,d_model)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
         self.input_norm = nn.LayerNorm(d_model)
         # 分类token [CLS]
@@ -334,7 +369,8 @@ class BrainRegionTransformer(nn.Module):
         
         # 1. 输入归一化和位置编码
         region_features = self.input_norm(region_features)
-        transformer_input = region_features + self.positional_encoding
+        transformer_input = self.addPs(region_features)
+        # transformer_input = region_features + self.positional_encoding
         
         # [可选优化：移除 CLS Token]
         # 如果使用 GAP，可以完全移除 [CLS] token，从而节省 1 个序列位置的计算和参数。
@@ -386,6 +422,7 @@ class UNetWithBrainRegionTransformer(nn.Module):
         # self.log_lambda_rba = nn.Parameter(torch.zeros(1))  # 对应 lambda_rba = exp(...)
         # self.log_lambda_consis = nn.Parameter(torch.zeros(1))
         # self.log_lambda_grad = nn.Parameter(torch.zeros(1))
+        
 
         self.log_lambda_rba = nn.Parameter(torch.tensor(0.0))      
         self.log_lambda_consis = nn.Parameter(torch.tensor(0.0))  

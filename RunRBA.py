@@ -72,13 +72,13 @@ class BrainAgeTrainer:
 #         )
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
-            T_0=10,      # 第一次周期 epoch 数
+            T_0=30,      # 第一次周期 epoch 数
             T_mult=2,    # 每次重启周期扩大倍数
-            eta_min=1e-7
+            eta_min=1e-5
         )
 
         # 初始化 Warmup 参数
-        self.warmup_epochs = 15  # Warmup 的 epoch 数
+        self.warmup_epochs = 8  # Warmup 的 epoch 数
         
         # 准备数据
         self.train_loader, self.val_loader = self._prepare_data()
