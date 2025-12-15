@@ -82,13 +82,35 @@ class conv_block(nn.Module):
         self.conv = nn.Sequential(
             nn.Conv3d(in_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm3d(out_ch),
-            nn.ReLU(inplace=False),
+            nn.LeakyReLU(inplace=False),
             nn.Conv3d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm3d(out_ch),
             nn.ReLU(inplace=False))
 
     def forward(self, x):
         return self.conv(x)
+    
+
+# class conv_block(nn.Module):
+#     def __init__(self, in_ch, out_ch):
+#         super().__init__()
+#         self.conv = nn.Sequential(
+#             nn.Conv3d(in_ch, out_ch, 3, padding=1, bias=False),
+#             nn.BatchNorm3d(out_ch),
+#             nn.LeakyReLU(inplace=True), # LeakyReLU 往往比 ReLU 表现更好
+#             nn.Conv3d(out_ch, out_ch, 3, padding=1, bias=False),
+#             nn.BatchNorm3d(out_ch)
+#         )
+#         self.shortcut = nn.Sequential()
+#         if in_ch != out_ch:
+#             self.shortcut = nn.Sequential(
+#                 nn.Conv3d(in_ch, out_ch, 1, bias=False),
+#                 nn.BatchNorm3d(out_ch)
+#             )
+#         self.relu = nn.LeakyReLU(inplace=True)
+
+#     def forward(self, x):
+#         return self.relu(self.conv(x) + self.shortcut(x))
 
 class up_conv(nn.Module):
     """
@@ -108,6 +130,7 @@ class up_conv(nn.Module):
         x = F.interpolate(x, size=self.size, mode='trilinear', align_corners=False)
         x = self.up(x)
         return x
+    
 
 class Attention_block(nn.Module):
     """
@@ -314,6 +337,84 @@ class AttU_Net_Shallow(nn.Module):
 
         # 返回所有尺度的特征
         return [e1,e3, d2, d1]
+    
+
+class AttU_Net_Mid(nn.Module):
+    """
+    Medium Attention U-Net with 3 downsampling steps
+    (增加了一层，现在有 3 层下采样)
+    """
+    def __init__(self, img_ch=1, output_ch=1, channel=16):
+        super(AttU_Net_Mid, self).__init__()
+
+        n1 = channel
+        # 1. 修改 Filters：增加一级深度 [16, 32, 64, 128]
+        filters = [n1, n1 * 2, n1 * 4, n1 * 8]
+
+        self.Maxpool1 = nn.MaxPool3d(kernel_size=2, stride=2)
+        self.Maxpool2 = nn.MaxPool3d(kernel_size=2, stride=2)
+        self.Maxpool3 = nn.MaxPool3d(kernel_size=2, stride=2) # 新增
+
+        # Encoder
+        self.Conv1 = conv_block(img_ch, filters[0])
+        self.Conv2 = conv_block(filters[0], filters[1])
+        self.Conv3 = conv_block(filters[1], filters[2])
+        self.Conv4 = conv_block(filters[2], filters[3]) # 新增：瓶颈层 (Bottleneck)
+
+        # Decoder - Stage 3 (新增的最深层)
+        # size=(22, 27, 22) 是根据 (45,54,45) 再次下采样计算得出的
+        self.Up3 = up_conv(filters[3], filters[2], size=(22, 27, 22)) 
+        self.Att3 = Attention_block(F_g=filters[2], F_l=filters[2], F_int=filters[1])
+        self.Up_conv3 = conv_block(filters[3], filters[2])
+
+        # Decoder - Stage 2 (原有的，连接 input 变为来自 d3)
+        self.Up2 = up_conv(filters[2], filters[1], size=(45, 54, 45))
+        self.Att2 = Attention_block(F_g=filters[1], F_l=filters[1], F_int=filters[0])
+        self.Up_conv2 = conv_block(filters[2], filters[1])
+
+        # Decoder - Stage 1 (原有的，连接 input 变为来自 d2)
+        self.Up1 = up_conv(filters[1], filters[0], size=(91, 109, 91))
+        self.Att1 = Attention_block(F_g=filters[0], F_l=filters[0], F_int=32)
+        self.Up_conv1 = conv_block(filters[1], filters[0])
+
+        # 如果你需要最后的输出层 conv1x1，可以在这里添加
+        # self.Conv_1x1 = nn.Conv3d(filters[0], output_ch, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        # --- Encoder ---
+        e1 = self.Conv1(x)          # [batch, 16, 91, 109, 91]
+        
+        e2 = self.Maxpool1(e1)
+        e2 = self.Conv2(e2)         # [batch, 32, 45, 54, 45]
+        
+        e3 = self.Maxpool2(e2)
+        e3 = self.Conv3(e3)         # [batch, 64, 22, 27, 22]
+
+        e4 = self.Maxpool3(e3)      
+        e4 = self.Conv4(e4)         # [batch, 128, 11, 13, 11] -> 新的瓶颈特征
+
+        # --- Decoder with attention ---
+        
+        # 新增的深层解码
+        d3 = self.Up3(e4)           # Upsample e4 to matches e3 size [22, 27, 22]
+        x3 = self.Att3(g=d3, x=e3)  # Attention using e3
+        d3 = torch.cat((x3, d3), dim=1)
+        d3 = self.Up_conv3(d3)      # [batch, 64, 22, 27, 22]
+
+        # 原有的解码层 (输入变为 d3)
+        d2 = self.Up2(d3)           # Upsample d3 to matches e2 size [45, 54, 45]
+        x2 = self.Att2(g=d2, x=e2)  # Attention using e2
+        d2 = torch.cat((x2, d2), dim=1)
+        d2 = self.Up_conv2(d2)      # [batch, 32, 45, 54, 45]
+
+        d1 = self.Up1(d2)           # Upsample d2 to matches e1 size [91, 109, 91]
+        x1 = self.Att1(g=d1, x=e1)  # Attention using e1
+        d1 = torch.cat((x1, d1), dim=1)
+        d1 = self.Up_conv1(d1)      # [batch, 16, 91, 109, 91]
+
+        # 返回特征：包含 Encoder浅层, Encoder深层(瓶颈), Decoder深层, Decoder中层, Decoder浅层
+        # 根据你的需求，通常 e4 是新的瓶颈层
+        return [e1, e4, d3, d2, d1]
 
 class BrainRegionTransformer(nn.Module):
     """
@@ -424,8 +525,8 @@ class UNetWithBrainRegionTransformer(nn.Module):
         # self.log_lambda_grad = nn.Parameter(torch.zeros(1))
         
 
-        self.log_lambda_rba = nn.Parameter(torch.tensor(0.0))      
-        self.log_lambda_consis = nn.Parameter(torch.tensor(0.0))  
+        self.log_lambda_rba = nn.Parameter(torch.tensor(1.0))      
+        self.log_lambda_consis = nn.Parameter(torch.tensor(-0.0))  
         self.log_lambda_grad = nn.Parameter(torch.tensor(0.0))   
 
         self.shared_age_predictor = nn.Sequential(

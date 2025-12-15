@@ -5,6 +5,7 @@ import torch
 import lmdb
 from torch import nn
 from tqdm import tqdm
+import numpy as np
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from scipy import stats
@@ -70,15 +71,21 @@ class BrainAgeTrainer:
 #             T_0=self.hp['scheduler_T0'],
 #             eta_min=self.hp['scheduler_eta_min']
 #         )
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        #     self.optimizer,
+        #     T_0=30,      # 第一次周期 epoch 数
+        #     T_mult=2,    # 每次重启周期扩大倍数
+        #     eta_min=1e-5
+        # )
+        self.warmup_epochs = 0  # Warmup 的 epoch 数
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
-            T_0=30,      # 第一次周期 epoch 数
-            T_mult=2,    # 每次重启周期扩大倍数
-            eta_min=1e-5
+            T_max=400,
+            eta_min=2e-5,
         )
 
         # 初始化 Warmup 参数
-        self.warmup_epochs = 8  # Warmup 的 epoch 数
+        
         
         # 准备数据
         self.train_loader, self.val_loader = self._prepare_data()
@@ -254,6 +261,7 @@ class BrainAgeTrainer:
             preds = outputs['BA'].float().squeeze()
             
 
+            # lambda_rba = 0.1
             lambda_rba = torch.exp(torch.clamp(model_core.log_lambda_rba, max=5.0))
             lambda_consistency = torch.exp(torch.clamp(model_core.log_lambda_consis, max=5.0))
             lambda_grad = torch.exp(torch.clamp(model_core.log_lambda_grad, max=5.0))
@@ -285,7 +293,7 @@ class BrainAgeTrainer:
                 )[0]
                 if grads is not None:
                     grads = grads.contiguous().detach()
-                    # grads = grads.detach() + 0.01 * e1
+                    grads = grads.detach() + 0.01 * e1
             with torch.no_grad():
                 outputs_noise = model_core(noise_img, region, only_rba=True)
                 rba_noise = outputs_noise['RBA'].detach().float()
@@ -314,7 +322,7 @@ class BrainAgeTrainer:
             # loss_consistency = torch.tensor(0.0, device=imgs.device)
             # grad_loss = torch.tensor(0.0, device=imgs.device)
             main_loss = self.criterion(preds, age)
-            rba_loss_all = lambda_rba * self.criterion(rba_reshaped, rba_age)
+            rba_loss_all = self.criterion(rba_reshaped, rba_age)
             
             if grads is not None:
                 # 构造脑区mask
@@ -323,17 +331,23 @@ class BrainAgeTrainer:
                 # 提取目标脑区梯度与其他脑区梯度
                 grad_in_region = grads * region_mask_grad
                 grad_out_region = grads * (1 - region_mask_grad)
-                
+                # has_nan = torch.any(grads.isnan())
+
+                # # --- 2. 绝对值最大值检测 ---
+                # max_abs_value = grads.abs().max()
+
+                # print(f"张量 'grads' 中是否包含 NaN: {has_nan.item()}")
+                # print(f"张量 'grads' 的绝对值最大值是: {max_abs_value.item()}")
                 # 构造梯度选择性loss
                 grad_loss = (
                     - F.l1_loss(grad_in_region, torch.zeros_like(grad_in_region), reduction='mean') +
                     0.1*F.l1_loss(grad_out_region, torch.zeros_like(grad_out_region), reduction='mean')
-                ) * lambda_grad*10
+                )
             else:
                 grad_loss = torch.tensor(1.0, device=imgs.device)
             # 4. 组合损失 - 暂时只使用主损失和RBA损失
             # self.accelerator.print(lambda_rba,rba_loss_all,loss_consistency)
-            loss = main_loss +  rba_loss_all + loss_consistency + grad_loss
+            loss = main_loss +  lambda_rba * rba_loss_all + loss_consistency + grad_loss * lambda_grad
             # loss = main_loss + lambda_rba * rba_loss_all
             # print(f"main_loss: {main_loss.item():.6f}, lambda_rba * rba_loss_all: {(lambda_rba * rba_loss_all).item():.6f}, grad_loss: {(grad_loss).item():.6f}")
             # 检查总损失
@@ -353,7 +367,7 @@ class BrainAgeTrainer:
             total_main_loss += main_loss.item()
             total_rba_loss += rba_loss_all.item()
             total_consistency_loss += loss_consistency.item()
-            total_grad_loss += grad_loss.item()
+            # total_grad_loss += grad_loss.item()
             
         #     # 7. 定期清理缓存
         #     if batch_idx % 20 == 0:
@@ -390,8 +404,10 @@ class BrainAgeTrainer:
             "total_loss": avg_loss,
             "main_loss": avg_main_loss,
             "consistency_loss": avg_consistency_loss,
-            "grad_loss": avg_grad_loss,
-            "rba_loss": avg_rba_loss
+            "grad_loss": 0,
+            "rba_loss": avg_rba_loss,
+            "lambda_rba": lambda_rba
+
         }
 
         return avg_losses
@@ -441,7 +457,21 @@ class BrainAgeTrainer:
         # 汇总指标
         all_preds = torch.cat(all_preds_list).numpy()
         all_ages = torch.cat(all_ages_list).numpy()
-        r_value, _ = stats.pearsonr(all_preds, all_ages)
+        # 在 _validate() 函数中，调用 pearsonr 之前
+        if np.any(np.isnan(all_preds)) or np.any(np.isinf(all_preds)):
+            print(f"[ERROR] all_preds contains NaN or Inf! Example: {all_preds}")
+            # 可选：保存出问题的 batch 或退出
+        if np.any(np.isnan(all_ages)) or np.any(np.isinf(all_ages)):
+            print(f"[ERROR] all_ages contains NaN or Inf! Example: {all_ages}")
+        mask = (
+            ~np.isnan(all_preds) & 
+            ~np.isnan(all_ages) &
+            ~np.isinf(all_preds) & 
+            ~np.isinf(all_ages)
+        )
+        clean_preds = all_preds[mask]
+        clean_ages  = all_ages[mask]
+        r_value, _ = stats.pearsonr(clean_preds, clean_ages)
 
         avg_metrics = {k: v / len(self.val_loader) for k, v in metrics.items()}
         avg_metrics['r'] = r_value
@@ -452,30 +482,13 @@ class BrainAgeTrainer:
         """完整的训练流程"""
         
         for epoch in range(self.start_epoch, self.hp['epochs']):
-            lr = 0
             # Warmup 阶段调整学习率
-            if epoch < self.warmup_epochs:
-                lr = self.hp['learning_rate'] * (epoch + 1) / self.warmup_epochs
-                self.optimizer.param_groups[0]['lr'] = lr
-                train_loss = self._train_epoch(self.optimizer)
-                val_metrics = self._validate()               
-            else:
-                # if epoch == 190:
-                #     self.optimizer.param_groups[0]['lr'] = 1e-4
-                #     self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                #     self.optimizer,
-                #     mode='min',
-                #     factor=0.95,
-                #     patience=4,
-                #     threshold=0.01,
-                #     threshold_mode='rel',
-                #     cooldown=0,
-                #     min_lr=1e-7,
-                #     eps=1e-9)
-                train_loss = self._train_epoch(self.optimizer)
-                val_metrics = self._validate()
-                self.scheduler.step(val_metrics['loss'])
-                lr = self.optimizer.param_groups[0]['lr']
+            train_loss = self._train_epoch(self.optimizer)
+            val_metrics = self._validate()
+            lr = self.optimizer.param_groups[0]['lr']
+            # self.scheduler.step(val_metrics['loss'])
+            self.scheduler.step()
+            
             
             
             # 主进程记录日志
@@ -493,7 +506,8 @@ class BrainAgeTrainer:
                     f"MAE: {val_metrics['mae']:.2f} | "
                     f"Val_RBA: {val_metrics['rba_loss']:.2f} | "
                     f"R²: {val_metrics['r2']:.4f} ｜ "
-                    f"R: {val_metrics['r']:.4f}"
+                    f"R: {val_metrics['r']:.4f} | "
+                    f"lambda_rba: {train_loss['lambda_rba']}"
                 )
                 self.accelerator.print(log_msg)
                 logging.info(log_msg)
@@ -528,7 +542,7 @@ HYPERPARAMETERS = {
 #     'val_csv': '/home/sjc/atun1/data/val_1.csv',
     'batch_size': 4,
     'num_workers': 1,
-    'channel':16,
+    'channel':32,
     
     # 模型参数
     'embed_dim': 64,
@@ -544,7 +558,7 @@ HYPERPARAMETERS = {
     
 
     # 训练参数
-    'epochs': 400,
+    'epochs': 270,
     'learning_rate': 1e-4,
     'weight_decay': 1e-2,
     
@@ -565,7 +579,7 @@ HYPERPARAMETERS = {
 }
 
 if __name__ == '__main__':
-    set_seed(3407)
+    set_seed(42)
     # 初始化环境
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
