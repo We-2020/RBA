@@ -293,7 +293,7 @@ class BrainAgeTrainer:
                 )[0]
                 if grads is not None:
                     grads = grads.contiguous().detach()
-                    grads = grads.detach() + 0.01 * e1
+                    grads = grads.detach() + 0.1 * e1
             with torch.no_grad():
                 outputs_noise = model_core(noise_img, region, only_rba=True)
                 rba_noise = outputs_noise['RBA'].detach().float()
@@ -341,7 +341,7 @@ class BrainAgeTrainer:
                 # 构造梯度选择性loss
                 grad_loss = (
                     - F.l1_loss(grad_in_region, torch.zeros_like(grad_in_region), reduction='mean') +
-                    0.1*F.l1_loss(grad_out_region, torch.zeros_like(grad_out_region), reduction='mean')
+                    0.01*F.l1_loss(grad_out_region, torch.zeros_like(grad_out_region), reduction='mean')
                 )
             else:
                 grad_loss = torch.tensor(1.0, device=imgs.device)
