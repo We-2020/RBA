@@ -9,7 +9,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 from accelerate import Accelerator
 from scipy import stats
-from utils import MyDataseGM,MyDataseT1w,MyDataseGmWmCsf,MyDataseGmWm,MyDataseGmWmCsfT1w,MyDataseT1wRBA,HybridROIDataset,MyDataseT1wRBA
+from utils import MyDataseGM,MyDataseT1w,MyDataseGmWmCsf,MyDataseGmWm,MyDataseGmWmCsfT1w,HybridROIDataset,MyDataseT1wRBA
 from model.RBA import UNetWithBrainRegionTransformer
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP

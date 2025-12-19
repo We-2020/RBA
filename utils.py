@@ -448,14 +448,14 @@ class MyDataseT1wRBA(Dataset):
     
         # 被注释的两个变换的计算量太大
         self.train_transforms = transforms.Compose([
-            transforms.RandSpatialCrop(roi_size=(80, 96, 80), random_center=True, random_size=False),
+            # transforms.RandSpatialCrop(roi_size=(80, 96, 80), random_center=True, random_size=False),
             transforms.Resize(spatial_size=shape),
-            transforms.RandFlip(prob=0.5, spatial_axis=0),
-            transforms.RandFlip(prob=0.5, spatial_axis=1),
-            transforms.RandRotate(range_x=0.1, range_y=0.1, range_z=0.1, prob=0.5),
-            transforms.RandAffine(prob=0.3, translate_range=(5,5,5), scale_range=(0.05,0.05,0.05)),
-            transforms.RandGaussianNoise(prob=0.3, std=0.05),
-            transforms.RandBiasField(prob=0.3),
+            # transforms.RandFlip(prob=0.5, spatial_axis=0),
+            # transforms.RandFlip(prob=0.5, spatial_axis=1),
+            # transforms.RandRotate(range_x=0.1, range_y=0.1, range_z=0.1, prob=0.5),
+            transforms.RandAffine(prob=0.2, translate_range=(5,5,5), scale_range=(0.05,0.05,0.05)),
+            transforms.RandGaussianNoise(prob=0.2, std=0.05),
+            transforms.RandBiasField(prob=0.2),
             transforms.RandAdjustContrast(prob=0.2, gamma=(0.7, 1.5)),
             transforms.NormalizeIntensity(nonzero=True, channel_wise=True)
         ])

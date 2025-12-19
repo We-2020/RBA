@@ -502,6 +502,48 @@ class BrainRegionTransformer(nn.Module):
         # output = self.regressor(gap_output)      # 如果使用 GAP
         
         return output
+    
+class GEGLUBlock(nn.Module):
+    """GEGLU: Gaussian Error Gated Linear Unit"""
+    def __init__(self, d_in, d_out):
+        super().__init__()
+        # 投影到两倍输出维度
+        self.proj = nn.Linear(d_in, d_out * 2)
+    
+    def forward(self, x):
+        x, gate = self.proj(x).chunk(2, dim=-1)
+        # 核心机制：值 * GELU(门)
+        return x * F.gelu(gate)
+
+class PowerfulAgePredictorV3(nn.Module):
+    def __init__(self, d_model, dropout=0.1):
+        super().__init__()
+        # 使用 GEGLU 块，通常会先稍微升维以获得更强的表达能力
+        hidden_dim = int(d_model * 1.5) 
+        
+        self.geglu_block = nn.Sequential(
+            nn.LayerNorm(d_model),
+            # 输入 d_model, 内部投影到 2*hidden_dim, 输出 hidden_dim
+            GEGLUBlock(d_model, hidden_dim), 
+            nn.Dropout(dropout)
+        )
+        
+        # 可以堆叠更多层，这里演示接一个标准层缩减维度
+        self.final_dense = nn.Sequential(
+            nn.Linear(hidden_dim, d_model // 2),
+            nn.LayerNorm(d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+
+        self.head = nn.Linear(d_model // 2, 1)
+        
+    def forward(self, x):
+        x = self.geglu_block(x)
+        x = self.final_dense(x)
+        x = self.head(x)
+        return x
+
 
 class UNetWithBrainRegionTransformer(nn.Module):
     def __init__(self, d_model, nhead, num_layers, dim_feedforward, dropout, num_brain_regions,channel=16):
@@ -529,12 +571,14 @@ class UNetWithBrainRegionTransformer(nn.Module):
         self.log_lambda_consis = nn.Parameter(torch.tensor(-0.0))  
         self.log_lambda_grad = nn.Parameter(torch.tensor(0.0))   
 
-        self.shared_age_predictor = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 2, 1)
-        )
+        # self.shared_age_predictor = nn.Sequential(
+        #     nn.Linear(d_model, d_model // 2),
+        #     nn.ReLU(),
+        #     nn.Dropout(dropout),
+        #     nn.Linear(d_model // 2, 1)
+        # )
+        self.shared_age_predictor = PowerfulAgePredictorV3(d_model,dropout)
+
 
     def forward(self, x, region_masks, only_rba=False):
         """
