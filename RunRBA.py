@@ -38,6 +38,7 @@ class BrainAgeTrainer:
         self.env2 = env2
         self.accelerator = Accelerator(split_batches=True)
         self.start_epoch = 0
+        self.current_stage = 1  # 初始为第一阶段：联合约束
         self.best_metrics = {
             'mae': float('inf'),
             'loss': float('inf'),
@@ -45,66 +46,30 @@ class BrainAgeTrainer:
             'epoch': 0
         }
     
-        # 添加检查点加载逻辑
         if self.hp.get('resume_from_checkpoint'):
             self._load_checkpoint(self.hp['resume_from_checkpoint'])
 
         self._setup_logging()
-        self._print_hyperparameters()
-        
-        # 初始化组件
         self.model = self._build_model()
         self.criterion = nn.MSELoss()
         self.L1 = nn.L1Loss()
+        
+        # 初始化第一阶段优化器
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), 
             lr=self.hp['learning_rate'],
             weight_decay=self.hp['weight_decay']
         )
-        # for i, (name, param) in enumerate(self.model.named_parameters()):
-        #     if i >= 59 and i <= 70:
-        #         print(f"Index {i}: {name}")
         
-        
-#         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-#             self.optimizer, 
-#             T_0=self.hp['scheduler_T0'],
-#             eta_min=self.hp['scheduler_eta_min']
-#         )
-        # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        #     self.optimizer,
-        #     T_0=30,      # 第一次周期 epoch 数
-        #     T_mult=2,    # 每次重启周期扩大倍数
-        #     eta_min=1e-5
-        # )
-        self.warmup_epochs = 0  # Warmup 的 epoch 数
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
-            T_max=400,
+            T_max=self.hp.get('epochs', 300),
             eta_min=2e-5,
         )
 
-        # 初始化 Warmup 参数
-        
-        
-        # 准备数据
         self.train_loader, self.val_loader = self._prepare_data()
         
-        # 使用accelerator准备组件
-#         (self.model, self.optimizer, self.train_loader, 
-#          self.val_loader, self.scheduler) = self.accelerator.prepare(
-#             self.model, self.optimizer, self.train_loader, 
-#             self.val_loader, self.scheduler
-#         )
-        # self.model.to(self.accelerator.device)
-
-        # # 手动包装 DDP，启用 find_unused_parameters
-        # self.model = DDP(self.model, device_ids=[self.accelerator.device], find_unused_parameters=True)
-        # (self.optimizer, self.train_loader, 
-        #  self.val_loader, self.scheduler) = self.accelerator.prepare(
-        #     self.optimizer, self.train_loader, 
-        #     self.val_loader, self.scheduler
-        # )
+        # 准备组件
         (self.model, self.optimizer, self.train_loader, 
          self.val_loader, self.scheduler) = self.accelerator.prepare(
             self.model, self.optimizer, self.train_loader, 
@@ -182,7 +147,21 @@ class BrainAgeTrainer:
         if self.accelerator.is_main_process:
             logging.info(f"Resuming training from epoch {self.start_epoch}")
 
+    def _prepare_stage2_optimizer(self):
+        """核心策略：阶段2 开启差分学习率，冻结大部分 Backbone 结构"""
+        self.accelerator.print(">>> [ALERT] Switching to Stage 2: Fine-tuning for BA Accuracy Peak")
+        model_core = self.model.module if hasattr(self.model, "module") else self.model
+        
+        # 分组参数：Predictor 层需要正常更新，Backbone 层极慢更新保持特征
+        predictor_params = [p for n, p in model_core.named_parameters() if any(k in n for k in ['predictor', 'regressor', 'head', 'final'])]
+        backbone_params = [p for n, p in model_core.named_parameters() if not any(k in n for k in ['predictor', 'regressor', 'head', 'final'])]
 
+        new_optimizer = torch.optim.AdamW([
+            {'params': backbone_params, 'lr': self.hp['learning_rate'] * 0.1}, 
+            {'params': predictor_params, 'lr': self.hp['learning_rate'] * 0.5}
+        ], weight_decay=self.hp['weight_decay'])
+        
+        self.optimizer = self.accelerator.prepare(new_optimizer)
 
     def _prepare_data(self):
         """准备数据加载器"""
@@ -219,198 +198,90 @@ class BrainAgeTrainer:
         return 1 - ss_res / ss_tot
 
     def _train_epoch(self, epoch):
-        """训练单个epoch - 修复NaN梯度问题"""
-        # torch.autograd.set_detect_anomaly(True)
-        # torch.autograd.set_detect_anomaly(True)
-        # torch.autograd.set_detect_anomaly(True)
         self.model.train()
-        total_loss = 0
-        total_main_loss = 0
-        total_consistency_loss = 0
-        total_grad_loss = 0
-        total_rba_loss = 0
-        
-        # 获取超参数
-        # lambda_consistency = self.hp.get('lambda_consistency', 0.1)
-        lambda_grad = self.hp.get('lambda_grad', 0.01)
-        # lambda_rba = self.hp.get('lambda_rba', 1.0)
-        sigma = self.hp.get('noise_sigma', 0.1)
-        num_regions = self.hp.get('num_regions', 117)
-
+        metrics_sum = {k: 0.0 for k in ['total', 'main', 'rba', 'cons', 'grad']}
         model_core = self.model.module if hasattr(self.model, "module") else self.model
-        
 
-
-        for batch_idx, (imgs, age, region, rba_age,noise_img,rand_region_idx) in enumerate(tqdm(self.train_loader, 
-                                    disable=not self.accelerator.is_local_main_process)):
-            # 清除梯度
-            if torch.isnan(imgs).any() or torch.isinf(imgs).any():
-                self.accelerator.print(f"Skipping batch {batch_idx} due to NaN/Inf in input images")
-                continue
+        for batch_idx, (imgs, age, region, rba_age, noise_img, rand_region_idx) in enumerate(tqdm(self.train_loader, disable=not self.accelerator.is_local_main_process)):
+            if torch.isnan(imgs).any(): continue
             self.optimizer.zero_grad()
             
-            # 准备数据
-            imgs = imgs.float()
-            region = region.float()
-            age = age.float().squeeze()
-            rba_age = rba_age.float()
+            imgs, region, age, rba_age = imgs.float(), region.float(), age.float().squeeze(), rba_age.float()
             
-            # 1. 主损失计算 - 使用更稳定的方法
-            # 前向传播
+            # 1. 前向传播
             outputs = self.model(imgs, region)
             preds = outputs['BA'].float().squeeze()
+            rba = outputs['RBA'].float().squeeze(-1) # [Batch, 117]
             
-
-            # lambda_rba = 0.1
-            lambda_rba = torch.exp(torch.clamp(model_core.log_lambda_rba, max=5.0))
-            lambda_consistency = torch.exp(torch.clamp(model_core.log_lambda_consis, max=5.0))
-            lambda_grad = torch.exp(torch.clamp(model_core.log_lambda_grad, max=5.0))
-            
-            # 2. RBA损失计算
-            rba = outputs['RBA'].float()
-            rba_reshaped = rba.squeeze(-1)
-            # rba_preds_for_grad = rba[torch.arange(rba.size(0)), rand_region_idx]
-            region_mask = region[torch.arange(region.size(0)), rand_region_idx, :, :, :]
-            if hasattr(self.model, "module"):
-                e1 = self.model.module.saved_e1
-            else:
-                e1 = self.model.saved_e1
-            # print(outputs['e1'].requires_grad, outputs['e1'].grad_fn)
-            # print(rba.requires_grad, rba.grad_fn)
-            grads = None
-            e1 = e1.contiguous()
-            rba = rba.contiguous()
-            grad_outputs = torch.ones_like(rba).contiguous()
-            if e1.requires_grad and rba.requires_grad:
-                grad_outputs = torch.ones_like(rba)
-                grads = torch.autograd.grad(
-                    outputs=rba,
-                    inputs=e1,
-                    grad_outputs=grad_outputs,
-                    create_graph=True,
-                    retain_graph=True,
-                    allow_unused=False
-                )[0]
-                if grads is not None:
-                    grads = grads.contiguous().detach()
-                    grads = grads.detach() + 0.1 * e1
-            with torch.no_grad():
-                outputs_noise = model_core(noise_img, region, only_rba=True)
-                rba_noise = outputs_noise['RBA'].detach().float()
-                # rba_noise = outputs_noise['RBA'].detach().clone()
-
-            # # 3. 简化训练：暂时移除噪声一致性损失和梯度损失
-            # # 先确保基础训练稳定，再逐步添加复杂损失
-            mask = torch.ones(117, dtype=torch.bool, device=rba.device)
-            mask[rand_region_idx] = 0  # 屏蔽该脑区
-            mask = mask.unsqueeze(0).expand(rba.shape[0], -1).unsqueeze(-1)  # [bs, 117, 1]
-
-            # 计算差异
-            diff = (rba - rba_noise)
-
-            # ⚠️ NaN/Inf防护
-            diff = torch.nan_to_num(diff, nan=0.0, posinf=1e4, neginf=-1e4)
-
-            # 加 mask
-            diff = diff * mask
-
-            # 避免 mask 全为 0
-            valid_count = mask.sum().clamp(min=1)
-
-            # 安全求平均
-            loss_consistency = lambda_consistency * (diff ** 2).sum() / valid_count
-            # loss_consistency = torch.tensor(0.0, device=imgs.device)
-            # grad_loss = torch.tensor(0.0, device=imgs.device)
+            # 2. 核心改进：Loss 量级对齐
+            # BA Loss: 均值处理
             main_loss = self.criterion(preds, age)
-            rba_loss_all = self.criterion(rba_reshaped, rba_age)
             
-            if grads is not None:
-                # 构造脑区mask
-                region_mask_grad = region_mask.unsqueeze(1).float()
+            # RBA Loss: 显式除以区域数量，使其在梯度贡献上与 BA 对等
+            # 这样 lambda_rba = 1.0 时，意味着 BA 和 整个RBA向量 的权重是 1:1
+            rba_loss_all = self.criterion(rba, rba_age) / self.hp['num_regions']
 
-                # 提取目标脑区梯度与其他脑区梯度
-                grad_in_region = grads * region_mask_grad
-                grad_out_region = grads * (1 - region_mask_grad)
-                # has_nan = torch.any(grads.isnan())
+            # 动态系数获取
+            lambda_rba = torch.exp(torch.clamp(model_core.log_lambda_rba, max=5.0))
+            
+            # 3. 辅助约束计算
+            if self.current_stage == 1:
+                # --- 一致性 Loss (优化版) ---
+                with torch.no_grad():
+                    outputs_noise = model_core(noise_img.float(), region, only_rba=True)
+                    rba_noise = outputs_noise['RBA'].detach().float().squeeze(-1)
+                
+                # 排除被修改的脑区
+                mask = torch.ones(self.hp['num_regions'], device=rba.device)
+                mask[rand_region_idx] = 0
+                diff = torch.nan_to_num(rba - rba_noise, nan=0.0) * mask.unsqueeze(0)
+                # 一致性也需要对齐量级
+                loss_consistency = (diff ** 2).mean() / self.hp['num_regions']
+                loss_consistency = loss_consistency * torch.exp(torch.clamp(model_core.log_lambda_consis, max=5.0))
 
-                # # --- 2. 绝对值最大值检测 ---
-                # max_abs_value = grads.abs().max()
+                # --- 梯度 Loss (带 NaN 防护) ---
+                e1 = model_core.saved_e1 if not hasattr(self.model, "module") else self.model.module.saved_e1
+                grad_loss = torch.tensor(0.0, device=rba.device)
+                if e1.requires_grad:
+                    grad_outputs = torch.ones_like(outputs['RBA'])
+                    # 计算 RBA 对中间特征 e1 的梯度
+                    grads = torch.autograd.grad(outputs=outputs['RBA'], inputs=e1, grad_outputs=grad_outputs, 
+                                                create_graph=True, retain_graph=True, allow_unused=True)[0]
+                    if grads is not None:
+                        # 确保梯度集中在目标脑区内
+                        region_mask = region[torch.arange(region.size(0)), rand_region_idx].unsqueeze(1)
+                        grad_in = grads * region_mask
+                        grad_out = grads * (1 - region_mask)
+                        # 这里使用 L1 惩罚区域外的梯度，鼓励区域内的梯度
+                        grad_loss = (-F.l1_loss(grad_in, torch.zeros_like(grad_in)) + 
+                                     0.01 * F.l1_loss(grad_out, torch.zeros_like(grad_out)))
 
-                # print(f"张量 'grads' 中是否包含 NaN: {has_nan.item()}")
-                # print(f"张量 'grads' 的绝对值最大值是: {max_abs_value.item()}")
-                # 构造梯度选择性loss
-                grad_loss = (
-                    - F.l1_loss(grad_in_region, torch.zeros_like(grad_in_region), reduction='mean') +
-                    0.01*F.l1_loss(grad_out_region, torch.zeros_like(grad_out_region), reduction='mean')
-                )
+                
+                total_loss = main_loss + lambda_rba * rba_loss_all + loss_consistency + grad_loss * torch.exp(torch.clamp(model_core.log_lambda_grad, max=5.0))
             else:
-                grad_loss = torch.tensor(1.0, device=imgs.device)
-            # 4. 组合损失 - 暂时只使用主损失和RBA损失
-            # self.accelerator.print(lambda_rba,rba_loss_all,loss_consistency)
-            loss = main_loss +  lambda_rba * rba_loss_all + loss_consistency + grad_loss * lambda_grad
-            # loss = main_loss + lambda_rba * rba_loss_all
-            # print(f"main_loss: {main_loss.item():.6f}, lambda_rba * rba_loss_all: {(lambda_rba * rba_loss_all).item():.6f}, grad_loss: {(grad_loss).item():.6f}")
-            # 检查总损失
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"Batch {batch_idx}: 总损失为NaN或inf, 主损失: {main_loss.item()},噪声loss: {loss_consistency.item()} RBA损失: {rba_loss_all.item()}")
-                continue
-            
-            # 5. 反向传播和优化
+                # 阶段 2：冲刺模式
+                # 进一步降低 RBA 干扰，专注于 BA 指标
+                loss_consistency = torch.tensor(0.0, device=rba.device)
+                grad_loss = torch.tensor(0.0, device=rba.device)
+                total_loss = main_loss + (lambda_rba * 0.2) * rba_loss_all + 0.00001*loss_consistency + 0.000001*grad_loss * torch.exp(torch.clamp(model_core.log_lambda_grad, max=5.0))
 
-            self.accelerator.backward(loss)
+            # 4. 反向传播
+            self.accelerator.backward(total_loss)
+            
+            # 阶段2增加梯度裁剪，防止最后阶段参数跑飞
+            if self.current_stage == 2:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), 0.5)
+                
             self.optimizer.step()
 
-            
-            # 6. 记录损失
-            batch_size = len(imgs)
-            total_loss += loss.item()
-            total_main_loss += main_loss.item()
-            total_rba_loss += rba_loss_all.item()
-            total_consistency_loss += loss_consistency.item()
-            # total_grad_loss += grad_loss.item()
-            
-        #     # 7. 定期清理缓存
-        #     if batch_idx % 20 == 0:
-        #         torch.cuda.empty_cache()
-            
-        #     # 8. 日志记录
-        #     if batch_idx % self.hp.get('log_interval', 50) == 0:
-        #         current_lr = self.optimizer.param_groups[0]['lr']
-        #         self.accelerator.print(
-        #             f'Train Epoch: {epoch} [{batch_idx * len(imgs)}/{len(self.train_loader.dataset)} '
-        #             f'({100. * batch_idx / len(self.train_loader):.0f}%)]\t'
-        #             f'Loss: {loss.item():.6f} | Main: {main_loss.item():.6f} | '
-        #             f'RBA: {rba_loss_all.item():.6f} | LR: {current_lr:.6f}'
-        #         )
-        
-        # # 计算平均损失
-        # num_samples = len(self.train_loader.dataset)
-        # if num_samples == 0:
-        #     return {
-        #         "total_loss": float('inf'),
-        #         "main_loss": float('inf'),
-        #         "consistency_loss": float('inf'),
-        #         "grad_loss": float('inf'),
-        #         "rba_loss": float('inf')
-        #     }
-        
-        avg_loss = total_loss / len(self.train_loader)
-        avg_main_loss = total_main_loss / len(self.train_loader)
-        avg_consistency_loss = total_consistency_loss / len(self.train_loader)
-        avg_grad_loss = total_grad_loss / len(self.train_loader)
-        avg_rba_loss = total_rba_loss / len(self.train_loader)
-        
-        avg_losses = {
-            "total_loss": avg_loss,
-            "main_loss": avg_main_loss,
-            "consistency_loss": avg_consistency_loss,
-            "grad_loss": 0,
-            "rba_loss": avg_rba_loss,
-            "lambda_rba": lambda_rba
+            # 记录数据
+            metrics_sum['total'] += total_loss.item()
+            metrics_sum['main'] += main_loss.item()
+            metrics_sum['rba'] += rba_loss_all.item() * self.hp['num_regions'] # 记录真实的 RBA MSE
+            metrics_sum['cons'] += loss_consistency.item()
+            metrics_sum['grad'] += grad_loss.item()
 
-        }
-
-        return avg_losses
+        return {k: v / len(self.train_loader) for k, v in metrics_sum.items()}
 
     def _validate(self):
         """验证过程"""
@@ -479,54 +350,73 @@ class BrainAgeTrainer:
     
 
     def train(self):
-        """完整的训练流程"""
+        """完整的训练流程：包含两阶段精度冲刺与详细指标记录"""
+        stage_switch = self.hp.get('stage_switch_epoch', 230)
+        self.accelerator.print(f"🚀 Training started. Total Epochs: {self.hp['epochs']} | Stage Switch Epoch: {stage_switch}")
         
         for epoch in range(self.start_epoch, self.hp['epochs']):
-            # Warmup 阶段调整学习率
-            train_loss = self._train_epoch(self.optimizer)
+            # 1. 阶段切换检查：进入 Stage 2 开启精度冲刺
+            if epoch >= stage_switch and self.current_stage == 1:
+                self.current_stage = 2
+                self._prepare_stage2_optimizer()
+                self.accelerator.print(f"\n{'='*30}\n>> Epoch {epoch+1}: Entering Stage 2 (Precision Peak Phase)\n{'='*30}")
+
+            # 2. 执行训练与验证
+            # _train_epoch 内部应返回包含 total_loss, main_loss, consistency_loss, grad_loss, rba_loss 的字典
+            train_metrics = self._train_epoch(epoch)
             val_metrics = self._validate()
-            lr = self.optimizer.param_groups[0]['lr']
-            # self.scheduler.step(val_metrics['loss'])
+            
+            # 3. 获取当前各组学习率 (针对差分学习率的情况)
+            lr_list = [group['lr'] for group in self.optimizer.param_groups]
+            if len(lr_list) == 1:
+                lr_str = f"{lr_list[0]:.2e}"
+            else:
+                # 显示核心骨干与预测头的不同学习率
+                lr_str = f"BK:{lr_list[0]:.1e}/HD:{lr_list[1]:.1e}"
+            
+            # 4. 更新调度器
             self.scheduler.step()
-            
-            
-            
-            # 主进程记录日志
+
+            # 5. 主进程打印详细过程日志
             if self.accelerator.is_main_process:
+                # 计算 RBA 对总梯度的实际贡献比 (加权后的 RBA Loss)
+                # train_metrics['rba_loss'] 是归一化后的 RBA MSE
+                lambda_rba = train_metrics.get('lambda_rba', 1.0)
+                rba_weight = lambda_rba * (0.2 if self.current_stage == 2 else 1.0)
                 
                 log_msg = (
-                    f"Epoch {epoch+1}/{self.hp['epochs']} | "
-                    f"LR: {lr:.2e} | "
-                    f"Train Loss: {train_loss['total_loss']:.4f} "
-                    f"(Main: {train_loss['main_loss']:.4f}, "
-                    f"Cons: {train_loss['consistency_loss']:.4f}, "
-                    f"Grad: {train_loss['grad_loss']:.12f}, "
-                    f"RBA: {train_loss['rba_loss']:.4f}) | "
-                    f"Val Loss: {val_metrics['loss']:.4f} | "
-                    f"MAE: {val_metrics['mae']:.2f} | "
-                    f"Val_RBA: {val_metrics['rba_loss']:.2f} | "
-                    f"R²: {val_metrics['r2']:.4f} ｜ "
+                    f"Epoch {epoch+1:03d}/{self.hp['epochs']} [S{self.current_stage}] | "
+                    f"LR: {lr_str} | "
+                    f"Train Loss: {train_metrics['total']:.4f} "
+                    f"(BA: {train_metrics['main']:.4f}, "
+                    f"RBA_w: {train_metrics['rba'] * rba_weight:.4f}, "
+                    f"Cons: {train_metrics['cons']:.4f}, "
+                    f"Grad: {train_metrics['grad']:.6f}) | "
+                    f"Val_BA_MAE: {val_metrics['mae']:.3f} | " 
+                    f"Val_RBA_MAE: {val_metrics['rba_loss']:.3f} | "
                     f"R: {val_metrics['r']:.4f} | "
-                    f"lambda_rba: {train_loss['lambda_rba']}"
+                    f"Best_MAE: {self.best_metrics['mae']:.3f}"
                 )
+                
                 self.accelerator.print(log_msg)
                 logging.info(log_msg)
 
-                # 保存最佳模型
+                # 6. 保存最佳模型
                 if val_metrics['mae'] < self.best_metrics['mae']:
-                    self.best_metrics = val_metrics.copy()
-                    self.best_metrics['epoch'] = epoch + 1
-#                     torch.save(
-#                         self.accelerator.unwrap_model(self.model).state_dict(),
-#                         os.path.join(self.hp['log_dir'], f"best_model_{self.hp['experiment_name']}.pth"))
+                    self.best_metrics = {**val_metrics, 'epoch': epoch + 1}
                     self._save_checkpoint(epoch)
+                    self.accelerator.print(f" ✨ New Best BA MAE Reached!")
 
-        # 记录最终结果
+        # 7. 记录最终结果
         final_log = (
+            f"\n" + "="*50 +
             f"\nBest Model Results (Epoch {self.best_metrics['epoch']}):\n"
-            f"MAE: {self.best_metrics['mae']:.2f} | "
-            f"MSE: {self.best_metrics['loss']:.4f} | "
-            f"R²: {self.best_metrics['r2']:.4f}"
+            f"MAE (BA): {self.best_metrics['mae']:.3f}\n"
+            f"MSE (BA): {self.best_metrics['loss']:.4f}\n"
+            f"MAE (RBA): {self.best_metrics.get('rba_loss', 0.0):.3f}\n"
+            f"R²: {self.best_metrics['r2']:.4f}\n"
+            f"Pearson R: {self.best_metrics['r']:.4f}\n" +
+            "="*50
         )
         self.accelerator.print(final_log)
         logging.info(final_log)

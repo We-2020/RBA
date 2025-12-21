@@ -659,7 +659,7 @@ if __name__ == '__main__':
     import nibabel as nib
     import numpy as np
     # 读取nii或nii.gz文件
-    img = nib.load("/home/cjx/Im/ROI_MNI_V4.nii")
+    img = nib.load("/home/caojiaxiang/brain age/Third/ROI_MNI_V4.nii")
     data = img.get_fdata()        # 获取为 numpy 数组
     # 测试参数
     num_regions = 117  # AAL图谱有116个脑区
@@ -669,25 +669,16 @@ if __name__ == '__main__':
     dim_feedforward = 512
     dropout = 0.1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    region_labels = [
-        0, 2001, 2002, 2101, 2102, 2111, 2112, 2201, 2202, 2211, 2212, 2301,
-        2302, 2311, 2312, 2321, 2322, 2331, 2332, 2401, 2402, 2501, 2502, 2601,
-        2602, 2611, 2612, 2701, 2702, 3001, 3002, 4001, 4002, 4011, 4012, 4021,
-        4022, 4101, 4102, 4111, 4112, 4201, 4202, 5001, 5002, 5011, 5012, 5021,
-        5022, 5101, 5102, 5201, 5202, 5301, 5302, 5401, 5402, 6001, 6002, 6101,
-        6102, 6201, 6202, 6211, 6212, 6221, 6222, 6301, 6302, 6401, 6402, 7001,
-        7002, 7011, 7012, 7021, 7022, 7101, 7102, 8101, 8102, 8111, 8112, 8121,
-        8122, 8201, 8202, 8211, 8212, 8301, 8302, 9001, 9002, 9011, 9012, 9021,
-        9022, 9031, 9032, 9041, 9042, 9051, 9052, 9061, 9062, 9071, 9072, 9081,
-        9082, 9100, 9110, 9120, 9130, 9140, 9150, 9160, 9170
-    ]
+    
 
     
     # 创建模型
     model = UNetWithBrainRegionTransformer(
         d_model, nhead, num_layers, dim_feedforward, dropout, num_regions
     ).to(device)
-
+    for i, (name, param) in enumerate(model.named_parameters()):
+        print(f"Index {i}: {name}")
+        if i == 5: break # 打印前几个看看
     
     # 测试输入
     batch_size = 1
@@ -696,36 +687,5 @@ if __name__ == '__main__':
     num_regions = len(region_labels)
     # region_masks = np.zeros((num_regions, *data.shape), dtype=np.uint8)
 
-    # # --- 4. 为每个脑区生成二值掩膜 ---
-    # for i, label in enumerate(region_labels):
-    #     region_mask = (data == label)
-    #     region_masks[i] = region_mask.astype(np.uint8)
-    # region_tensor = torch.from_numpy(region_masks)
-    # torch.save(region_tensor, "/home/cjx/afterHW/ATUN/AAL_regions_116.pt")
-    region_tensor = torch.load("/home/cjx/afterHW/ATUN/AAL_regions_116.pt")  # [116, 91, 109, 91]
 
-    region_tensor = region_tensor.unsqueeze(0)  # [1, 116, 91, 109, 91]
-    region_tensor = region_tensor.repeat(batch_size, 1, 1, 1, 1)  # [8, 116, 91, 109, 91]
-    region_masks = region_tensor.to(device)
-    outputs = model(x, region_masks)
-    grads = torch.autograd.grad(
-        outputs=outputs['RBA'],
-        inputs=model.saved_e1,
-        grad_outputs=torch.ones_like(outputs['RBA']),
-        create_graph=True,
-        retain_graph=True,
-        allow_unused=True
-    )[0]
-    print(grads)
-
-    # evaluate_model_complexity(model, x, region_masks)
-    
-    with torch.no_grad():
-        outputs_noise = model(x, region_masks,only_rba=True)
-        # rba_noise = outputs_noise['RBA'].detach().clone()
-    
-
-    # # 测试完整模型
-    
-    # print(f"Output shape: {output.shape}")
     
